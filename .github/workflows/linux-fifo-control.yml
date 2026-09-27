@@ -1,0 +1,203 @@
+name: Linux FIFO same-host control
+
+on:
+  push:
+    branches:
+      - ln-cx/ninja-2689-linux-fifo-control-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install focused control dependencies
+        run: |
+          set -euo pipefail
+          export LC_ALL=C DEBIAN_FRONTEND=noninteractive
+          capture_apt() {
+            local step="$1" output rc kind
+            shift
+            if output=$("$@" 2>&1); then
+              printf '%s rc=0 bytes=%s\n' "$step" "${#output}"
+              return
+            else
+              rc=$?
+            fi
+            case "$output" in
+              *'Temporary failure resolving'*|*'Could not resolve'*) kind=dns ;;
+              *'Unable to locate package'*) kind=package_unavailable ;;
+              *'404 Not Found'*|*'403 Forbidden'*) kind=http_status ;;
+              *) kind=other ;;
+            esac
+            printf '%s rc=%s bytes=%s class=%s\n' "$step" "$rc" "${#output}" "$kind" >&2
+            exit "$rc"
+          }
+          capture_apt apt_update apt-get update -qq -o APT::Update::Error-Mode=any
+          capture_apt apt_install apt-get install -y -qq --no-install-recommends \
+            ca-certificates cmake g++ git binutils ninja-build python3 python3-pytest util-linux
+
+      - name: Check out diagnostic workflow
+        uses: actions/checkout@v7
+        with:
+          path: control
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out exact tests-only baseline
+        uses: actions/checkout@v7
+        with:
+          path: baseline
+          ref: d9317832a80d3862e1a3b7629b883227401d84f2
+          persist-credentials: false
+
+      - name: Check out exact fixed revision
+        uses: actions/checkout@v7
+        with:
+          path: fixed
+          ref: efa9ac0b9825519ecdd86799bc73f69586ae0469
+          persist-credentials: false
+
+      - name: Build both revisions and run the unchanged FIFO method
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          workspace = Path(os.environ['GITHUB_WORKSPACE'])
+          revisions = {
+              'baseline': 'd9317832a80d3862e1a3b7629b883227401d84f2',
+              'fixed': 'efa9ac0b9825519ecdd86799bc73f69586ae0469',
+          }
+          same_files = (
+              'CMakeLists.txt',
+              '.github/workflows/linux.yml',
+              'misc/jobserver_test.py',
+              'misc/jobserver_pool.py',
+              'misc/jobserver_test_helper.py',
+              'src/jobserver-posix.cc',
+          )
+          source_files = same_files + ('src/ninja.cc', 'src/getopt.c', 'src/getopt.h')
+          node = '../../misc/jobserver_test.py::JobserverTest::test_jobserver_client_with_posix_fifo'
+
+          def file_hash(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def setup_command(label, args, cwd):
+              result = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              print(json.dumps({
+                  'step': label, 'command': args, 'cwd': str(cwd), 'exit': result.returncode,
+                  'stdout_bytes': len(result.stdout), 'stderr_bytes': len(result.stderr),
+              }), flush=True)
+              if result.returncode:
+                  print('SETUP_FAILURE: no FIFO result inferred', file=sys.stderr, flush=True)
+                  raise SystemExit(2)
+              return result.stdout.decode('utf-8', 'replace')
+
+          control = workspace / 'control'
+          control_sha = setup_command('control_ref', ['git', 'rev-parse', 'HEAD'], control).strip()
+          if control_sha != os.environ['GITHUB_SHA']:
+              print('SETUP_FAILURE: control ref mismatch', file=sys.stderr)
+              raise SystemExit(2)
+          workflow = control / '.github/workflows/linux-fifo-control.yml'
+          print(json.dumps({'control_head': control_sha, 'workflow_sha256': file_hash(workflow)}), flush=True)
+          print(json.dumps({
+              'runner': os.environ.get('RUNNER_NAME'),
+              'runner_os': os.environ.get('RUNNER_OS'),
+              'runner_arch': os.environ.get('RUNNER_ARCH'),
+              'run_id': os.environ.get('GITHUB_RUN_ID'),
+              'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+              'container': Path('/etc/os-release').read_text().split('PRETTY_NAME=', 1)[-1].splitlines()[0].strip('"'),
+              'kernel': platform.release(),
+              'cpu_count': os.cpu_count(),
+              'cpu_affinity': sorted(os.sched_getaffinity(0)),
+          }), flush=True)
+
+          hashes = {}
+          for name, expected in revisions.items():
+              source = workspace / name
+              actual = setup_command(name + '_ref', ['git', 'rev-parse', 'HEAD'], source).strip()
+              if actual != expected:
+                  print('SETUP_FAILURE: source ref mismatch for ' + name, file=sys.stderr)
+                  raise SystemExit(2)
+              hashes[name] = {path: file_hash(source / path) for path in source_files}
+              print(json.dumps({'revision': name, 'head': actual, 'source_sha256': hashes[name]}, sort_keys=True), flush=True)
+          if any(hashes['baseline'][path] != hashes['fixed'][path] for path in same_files):
+              print('SETUP_FAILURE: test or helper source mismatch', file=sys.stderr)
+              raise SystemExit(2)
+
+          binaries = {}
+          for name in revisions:
+              source = workspace / name
+              setup_command(name + '_configure', [
+                  'cmake', '-Bbuild-gcc', '-DCMAKE_BUILD_TYPE=Debug',
+                  '-G', 'Ninja Multi-Config', '-DBUILD_TESTING=OFF',
+              ], source)
+              setup_command(name + '_build', [
+                  'cmake', '--build', 'build-gcc', '--config', 'Debug',
+                  '--target', 'ninja', '--parallel', '8',
+              ], source)
+              binary = source / 'build-gcc/Debug/ninja'
+              binaries[name] = binary
+              cache = (source / 'build-gcc/CMakeCache.txt').read_text()
+              compilers = {}
+              for language in ('CXX',):
+                  match = re.search(r'^CMAKE_' + language + r'_COMPILER:FILEPATH=(.+)$', cache, re.M)
+                  if not match:
+                      print('SETUP_FAILURE: compiler provenance missing', file=sys.stderr)
+                      raise SystemExit(2)
+                  compiler = Path(match.group(1)).resolve()
+                  version = setup_command(name + '_' + language + '_compiler_version', [str(compiler), '--version'], source)
+                  compilers[language] = {
+                      'path': str(compiler), 'sha256': file_hash(compiler),
+                      'version_first_line': version.splitlines()[0],
+                  }
+              nm_output = setup_command(name + '_dynamic_symbols', ['nm', '-D', str(binary)], source)
+              getopt_symbols = [
+                  line.strip() for line in nm_output.splitlines()
+                  if re.search(r'\b(?:__)?getopt(?:_long(?:_only)?)?(?:@|$)', line)
+              ]
+              print(json.dumps({
+                  'revision': name, 'binary': str(binary), 'binary_sha256': file_hash(binary),
+                  'compilers': compilers, 'dynamic_getopt_symbols': getopt_symbols,
+              }, sort_keys=True), flush=True)
+
+          order = ('baseline', 'fixed', 'fixed', 'baseline', 'baseline', 'fixed')
+          results = []
+          for number, name in enumerate(order, 1):
+              cwd = binaries[name].parent
+              command = ['pytest-3', '-vv', '-s', node]
+              print(json.dumps({'case_start': number, 'revision': name, 'command': command, 'cwd': str(cwd)}), flush=True)
+              try:
+                  result = subprocess.run(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              except OSError:
+                  print('SETUP_FAILURE: pytest could not start', file=sys.stderr, flush=True)
+                  raise SystemExit(2)
+              print('CASE_STDOUT_BEGIN ' + str(number), flush=True)
+              sys.stdout.buffer.write(result.stdout)
+              sys.stdout.buffer.flush()
+              print('CASE_STDOUT_END ' + str(number), flush=True)
+              print('CASE_STDERR_BEGIN ' + str(number), file=sys.stderr, flush=True)
+              sys.stderr.buffer.write(result.stderr)
+              sys.stderr.buffer.flush()
+              print('CASE_STDERR_END ' + str(number), file=sys.stderr, flush=True)
+              results.append({'case': number, 'revision': name, 'exit': result.returncode,
+                              'stdout_bytes': len(result.stdout), 'stderr_bytes': len(result.stderr),
+                              'stdout_sha256': hashlib.sha256(result.stdout).hexdigest(),
+                              'stderr_sha256': hashlib.sha256(result.stderr).hexdigest()})
+              print(json.dumps({'case_end': results[-1]}, sort_keys=True), flush=True)
+          print(json.dumps({'six_case_summary': results}, sort_keys=True), flush=True)
+          raise SystemExit(1 if any(case['exit'] != 0 for case in results) else 0)
+          PY
