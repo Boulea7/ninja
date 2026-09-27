@@ -1,0 +1,73 @@
+name: Native tool-target diagnostic
+
+on:
+  push:
+    branches:
+      - ln-cx/ninja-2689-native-diagnostic-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  tool-targets:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install re2c on Windows
+        if: runner.os == 'Windows'
+        run: choco install re2c
+      - name: Configure and build
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cmake -S . -B build -A x64 -DCMAKE_COMPILE_WARNING_AS_ERROR=1
+          else
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          fi
+          cmake --build build --parallel --config Release
+      - name: Record runner and file hashes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          binary = Path('build/Release/ninja.exe' if os.environ['RUNNER_OS'] == 'Windows' else 'build/ninja')
+          test_binary = Path('build/Release/ninja_test.exe' if os.environ['RUNNER_OS'] == 'Windows' else 'build/ninja_test')
+          files = [Path('misc/output_test.py'), Path('src/ninja.cc'), Path('src/getopt.c'),
+                   Path('.github/workflows/ninja-targets-native-diagnostic.yml'), binary, test_binary]
+          print('runner_os=' + os.environ['RUNNER_OS'])
+          print('runner_arch=' + os.environ['RUNNER_ARCH'])
+          print('run_id=' + os.environ['GITHUB_RUN_ID'])
+          print('head_sha=' + os.environ['GITHUB_SHA'])
+          for path in files:
+              print(str(path) + ' sha256=' + hashlib.sha256(path.read_bytes()).hexdigest())
+          PY
+      - name: Run C++ tests
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            ./build/Release/ninja_test.exe
+          else
+            ./build/ninja_test
+          fi
+      - name: Run focused CLI tests
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cd build/Release
+            python ../../misc/output_test.py ToolTargets -v
+          else
+            cd build
+            python ../misc/output_test.py ToolTargets -v
+          fi
